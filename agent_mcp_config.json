@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json.schemastore.org/partial-mcp-config.json",
+  "description": "AgentFlow MCP Server configuration for autonomous AI agents, Cursor, and Claude Desktop.",
+  "claude_desktop_example": {
+    "file_location": {
+      "macos": "~/Library/Application Support/Claude/claude_desktop_config.json",
+      "windows": "%APPDATA%\\Claude\\claude_desktop_config.json"
+    },
+    "mcpServers": {
+      "agentflow": {
+        "command": "python3",
+        "args": [
+          "-m",
+          "backend.mcp_server",
+          "--transport",
+          "stdio"
+        ],
+        "cwd": "/Users/adithyasaineeli/Desktop/Agentflow",
+        "env": {
+          "DATABASE_URL": "postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres",
+          "OPENAI_API_KEY": "sk-proj-...",
+          "AGENTFLOW_API_KEY": "agent-bearer-token"
+        }
+      }
+    }
+  },
+  "cursor_mcp_example": {
+    "file_location": ".cursor/mcp.json",
+    "mcpServers": {
+      "agentflow-stdio": {
+        "command": "python3",
+        "args": [
+          "-m",
+          "backend.mcp_server",
+          "--transport",
+          "stdio"
+        ],
+        "cwd": "/Users/adithyasaineeli/Desktop/Agentflow",
+        "env": {
+          "DATABASE_URL": "postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres",
+          "OPENAI_API_KEY": "sk-proj-..."
+        }
+      },
+      "agentflow-streamable-http": {
+        "url": "http://localhost:8001/sse",
+        "headers": {
+          "Authorization": "Bearer agent-bearer-token"
+        }
+      }
+    }
+  }
+}

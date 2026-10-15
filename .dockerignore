@@ -1,0 +1,25 @@
+# Git & Cache
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.coverage
+
+# Virtual Environment
+.venv
+env
+venv
+
+# Local SQLite databases & env
+*.db
+*.sqlite3
+.env
+!.env.example
+
+# Frontend (if building backend container from repo root)
+frontend/node_modules
+frontend/.next
+frontend/out

@@ -1,0 +1,9 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+sqlalchemy>=2.0.25
+pgvector>=0.2.5
+psycopg2-binary>=2.9.9
+pydantic>=2.6.0
+python-dotenv>=1.0.1
+fastmcp>=0.1.0
+openai>=1.12.0
