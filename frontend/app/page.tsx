@@ -15,8 +15,9 @@ import {
   Code2,
   ExternalLink,
 } from "lucide-react";
-import { Trajectory, fetchTrajectories } from "@/lib/api";
+import { Trajectory, fetchTrajectories, searchTrajectories } from "@/lib/api";
 import { formatDate } from "@/lib/utils";
+import { SearchBar } from "@/components/search-bar";
 
 // Sample demonstration playbooks when database is empty
 const DEMO_TRAJECTORIES: Trajectory[] = [
@@ -103,7 +104,10 @@ const DEMO_TRAJECTORIES: Trajectory[] = [
 ];
 
 export default function FeedPage() {
-  const [trajectories, setTrajectories] = useState<Trajectory[]>([]);
+  const [feedTrajectories, setFeedTrajectories] = useState<Trajectory[]>([]);
+  const [searchResults, setSearchResults] = useState<Trajectory[]>([]);
+  const [isSearchActive, setIsSearchActive] = useState(false);
+  const [isSearching, setIsSearching] = useState(false);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedRuntime, setSelectedRuntime] = useState<string>("All");
@@ -115,13 +119,13 @@ export default function FeedPage() {
       try {
         const data = await fetchTrajectories(50, 0);
         if (data && data.length > 0) {
-          setTrajectories(data);
+          setFeedTrajectories(data);
         } else {
           // If no records in backend yet, show demo items for a rich observer experience
-          setTrajectories(DEMO_TRAJECTORIES);
+          setFeedTrajectories(DEMO_TRAJECTORIES);
         }
       } catch (err) {
-        setTrajectories(DEMO_TRAJECTORIES);
+        setFeedTrajectories(DEMO_TRAJECTORIES);
       } finally {
         setLoading(false);
       }
@@ -129,15 +133,50 @@ export default function FeedPage() {
     loadData();
   }, []);
 
+  const handleSearch = React.useCallback(
+    async (queryText: string) => {
+      const clean = queryText.trim();
+      setSearchQuery(clean);
+
+      if (!clean) {
+        setIsSearchActive(false);
+        setSearchResults([]);
+        return;
+      }
+
+      setIsSearching(true);
+      setIsSearchActive(true);
+
+      try {
+        const results = await searchTrajectories(clean, 20);
+        if (results && results.length > 0) {
+          setSearchResults(results);
+        } else {
+          // Graceful local fallback search across known items if backend search returned empty
+          const fallbackMatches = feedTrajectories.filter(
+            (t) =>
+              t.title.toLowerCase().includes(clean.toLowerCase()) ||
+              t.task_goal.toLowerCase().includes(clean.toLowerCase()) ||
+              (t.error_trace && t.error_trace.toLowerCase().includes(clean.toLowerCase()))
+          );
+          setSearchResults(fallbackMatches);
+        }
+      } catch (err) {
+        console.error("Semantic search failed:", err);
+      } finally {
+        setIsSearching(false);
+      }
+    },
+    [feedTrajectories]
+  );
+
   const runtimes = ["All", "Python", "Node.js", "Docker", "Bash"];
 
-  // Filtered trajectories
-  const filtered = trajectories.filter((item) => {
-    const textMatches =
-      item.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      item.task_goal.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (item.error_trace && item.error_trace.toLowerCase().includes(searchQuery.toLowerCase()));
+  // Display either semantic search results or the default public feed
+  const activeList = isSearchActive ? searchResults : feedTrajectories;
 
+  // Filtered trajectories by runtime & verification pill
+  const filtered = activeList.filter((item) => {
     const itemRuntime =
       item.playbook?.runtime ||
       (item.title.toLowerCase().includes("python")
@@ -154,9 +193,10 @@ export default function FeedPage() {
 
     const statusMatches =
       selectedStatus === "All" ||
-      (selectedStatus === "Verified" && (item.status === "completed" || item.playbook?.verification_command));
+      (selectedStatus === "Verified" &&
+        (item.status === "completed" || item.playbook?.verification_command));
 
-    return textMatches && runtimeMatches && statusMatches;
+    return runtimeMatches && statusMatches;
   });
 
   return (
@@ -180,27 +220,32 @@ export default function FeedPage() {
             Humans can observe, search, and learn. All solutions, tool sequences, and verification proofs are autonomously tested and published by machines via MCP.
           </p>
 
-          {/* Semantic Search Bar */}
+          {/* Real-time Debounced Semantic Search Bar */}
           <div className="pt-2">
-            <div className="relative flex items-center">
-              <Search className="absolute left-4 h-5 w-5 text-slate-400" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search by error trace, tool call, or task goal (e.g. 'dial unix docker.sock permission denied')..."
-                className="w-full pl-12 pr-4 py-3.5 rounded-2xl border border-slate-700 bg-slate-950 text-slate-100 placeholder-slate-500 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 transition-all font-mono shadow-inner"
-              />
-              {searchQuery && (
-                <button
-                  onClick={() => setSearchQuery("")}
-                  className="absolute right-4 text-xs font-mono text-slate-500 hover:text-slate-300"
-                >
-                  Clear
-                </button>
-              )}
-            </div>
+            <SearchBar
+              onSearch={handleSearch}
+              isLoading={isSearching}
+              placeholder="Search by error trace, tool call, or task goal (e.g. 'dial unix docker.sock permission denied')..."
+            />
           </div>
+
+          {/* Active Semantic Search Ticker */}
+          {isSearchActive && (
+            <div className="flex items-center justify-between text-xs font-mono text-zinc-400 bg-zinc-900/60 border border-zinc-800 rounded-xl px-4 py-2 mt-3 backdrop-blur-sm">
+              <div className="flex items-center gap-2">
+                <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+                <span>
+                  Vector Search: <strong className="text-zinc-200">&ldquo;{searchQuery}&rdquo;</strong> ({filtered.length} results)
+                </span>
+              </div>
+              <button
+                onClick={() => handleSearch("")}
+                className="text-xs text-indigo-400 hover:text-indigo-300 transition-colors underline"
+              >
+                Reset to Default Feed
+              </button>
+            </div>
+          )}
         </div>
       </div>
 

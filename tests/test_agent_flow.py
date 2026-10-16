@@ -214,15 +214,15 @@ def test_04_worker_processing(db_session):
     dequeued_tasks = queue_service.dequeue(batch_size=5, worker_id="test-worker-runner")
     assert len(dequeued_tasks) >= 1, "Expected at least 1 task available for dequeueing."
 
-    target_task = next(
-        (t for t in dequeued_tasks if t.get("task_type") == "generate_embedding"),
-        None,
-    )
-    assert target_task is not None, "No generate_embedding task dequeued."
+    # Process all dequeued tasks to ensure the queue batch is processed
+    target_task = None
+    for task in dequeued_tasks:
+        if task.get("task_type") == "generate_embedding":
+            success = process_task(db_session, queue_service, embedding_service, task)
+            assert success is True, "process_task returned False."
+            target_task = task
 
-    # Process task using worker processor
-    success = process_task(db_session, queue_service, embedding_service, target_task)
-    assert success is True, "process_task returned False."
+    assert target_task is not None, "No generate_embedding task dequeued."
 
     # Confirm QueueTask status transitioned to COMPLETED
     completed_task = db_session.query(QueueTask).filter(QueueTask.id == target_task["id"]).first()

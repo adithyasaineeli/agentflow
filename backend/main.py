@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 
 from backend.database import Base, engine, get_db
 from backend.models import Agent, Trajectory
+from backend.services.embedding_service import BaseEmbeddingService, get_embedding_service
 from backend.services.queue_service import BaseQueue, PostgresSkipLockedQueue
 from backend.services.vector_service import BaseVectorSearch, PgVectorService
 
@@ -44,10 +45,17 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Allow frontend to access the public read feed & search
+# Configure CORS origins: restrict to production and development domains, configurable via ALLOWED_ORIGINS env
+allowed_origins_raw = os.getenv(
+    "ALLOWED_ORIGINS",
+    "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001,https://agentflow.vercel.app",
+)
+allowed_origins = [origin.strip() for origin in allowed_origins_raw.split(",") if origin.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app" if os.getenv("ALLOW_VERCEL_PREVIEWS", "true").lower() in ("true", "1", "yes") else None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -79,19 +87,11 @@ def get_current_agent(
     token = credentials.credentials.strip()  # Ensure no hidden whitespace
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
 
-    # Temporary diagnostic log:
-    print(f"[DEBUG AUTH] Incoming raw token: '{token}'")
-    print(f"[DEBUG AUTH] Computed SHA-256 hash: '{token_hash}'")
-    
     agent = (
         db.query(Agent)
         .filter(Agent.api_key_hash == token_hash, Agent.is_active.is_(True))
         .first()
     )
-
-    total_agents = db.query(Agent).count()
-    print(f"[DEBUG AUTH] Total agents found in connected DB: {total_agents}")
-    print(f"[DEBUG AUTH] Found agent: {agent}")
 
     if not agent:
         raise HTTPException(
@@ -126,11 +126,10 @@ class TrajectoryResponse(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    query_embedding: List[float] = Field(..., description="1536-dim vector representing query text/error")
-    limit: int = Field(10, ge=1, le=50, description="Max results to return")
-    similarity_threshold: Optional[float] = Field(
-        None, ge=0.0, le=1.0, description="Minimum cosine similarity cutoff"
-    )
+    query: Optional[str] = Field(None, description="Plain-text problem description or error trace")
+    query_embedding: Optional[List[float]] = Field(None, description="Optional pre-computed 1536-dim vector")
+    limit: int = Field(10, ge=1, le=50)
+    similarity_threshold: Optional[float] = None
 
 
 class SearchResult(BaseModel):
@@ -209,10 +208,20 @@ def create_trajectory(
 def search_trajectories(
     request: SearchRequest,
     vector_search: BaseVectorSearch = Depends(get_vector_service),
+    embedder: BaseEmbeddingService = Depends(get_embedding_service),
 ):
     """Semantic vector match against past agent playbooks and error solutions."""
+    embedding = request.query_embedding
+    if not embedding:
+        if not request.query:
+            raise HTTPException(
+                status_code=400,
+                detail="Must provide either 'query' or 'query_embedding'",
+            )
+        embedding = embedder.generate_embedding(request.query)
+
     return vector_search.search(
-        query_embedding=request.query_embedding,
+        query_embedding=embedding,
         limit=request.limit,
         similarity_threshold=request.similarity_threshold,
     )

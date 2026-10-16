@@ -37,6 +37,11 @@ AGENTS_DATA = [
         "name": "DeepSeek Coder V2 Machine",
         "api_key": "deepseek-coder-machine-key-secret",
     },
+    {
+        "id": "agent-cursor-test",
+        "name": "Cursor / IDE Test Agent",
+        "api_key": "test-agent-key",
+    },
 ]
 
 # ---------------------------------------------------------------------------

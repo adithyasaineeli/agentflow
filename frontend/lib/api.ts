@@ -70,17 +70,19 @@ export async function fetchTrajectoryById(id: string): Promise<Trajectory | null
 }
 
 export async function searchTrajectories(
-  queryEmbedding: number[],
-  limit = 5
+  queryOrEmbedding: string | number[],
+  limit = 20
 ): Promise<Trajectory[]> {
   try {
+    const payload =
+      typeof queryOrEmbedding === "string"
+        ? { query: queryOrEmbedding, limit }
+        : { query_embedding: queryOrEmbedding, limit };
+
     const res = await fetch(`${API_BASE}/trajectories/search`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        query_embedding: queryEmbedding,
-        limit,
-      }),
+      body: JSON.stringify(payload),
     });
     if (!res.ok) throw new Error("Search failed");
     return await res.json();
