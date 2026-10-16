@@ -287,3 +287,91 @@ def test_06_public_read_feed(client):
     assert matched_item is not None, "Indexed trajectory not found in public feed."
     assert matched_item["status"] == "completed"
     assert matched_item["task_goal"] != ""
+
+
+def test_07_healthz_deep_liveness(client):
+    """Step 7: Deep health check endpoint returns 200 OK and connected statuses."""
+    res = client.get("/healthz")
+    assert res.status_code == 200, f"Healthz failed: {res.text}"
+    body = res.json()
+    assert body["status"] == "healthy"
+    assert body["database"] == "connected"
+    assert body["embedding_service"] == "active"
+    assert "timestamp" in body
+
+
+def test_08_payload_boundary_enforcement(client):
+    """Step 8: Defensive payload caps reject oversized input with HTTP 422."""
+    valid_payload = {
+        "title": "Fix Webpack HMR loop in development",
+        "task_goal": "Resolve infinite fast-refresh reload loop in Next.js",
+        "error_trace": "Warning: Fast Refresh did not reload properly.",
+        "playbook": {"steps": [{"tool": "edit_file"}]},
+    }
+    headers = {"Authorization": f"Bearer {TEST_RAW_TOKEN}"}
+
+    # 1. Reject error_trace exceeding 20,000 characters
+    oversized_error = dict(valid_payload, error_trace="E" * 20001)
+    res1 = client.post("/api/v1/trajectories", json=oversized_error, headers=headers)
+    assert res1.status_code == 422, f"Expected 422 for oversized error_trace, got {res1.status_code}"
+
+    # 2. Reject title shorter than 5 characters
+    short_title = dict(valid_payload, title="bad")
+    res2 = client.post("/api/v1/trajectories", json=short_title, headers=headers)
+    assert res2.status_code == 422, f"Expected 422 for short title, got {res2.status_code}"
+
+    # 3. Reject task_goal exceeding 2,000 characters
+    oversized_goal = dict(valid_payload, task_goal="G" * 2001)
+    res3 = client.post("/api/v1/trajectories", json=oversized_goal, headers=headers)
+    assert res3.status_code == 422, f"Expected 422 for oversized task_goal, got {res3.status_code}"
+
+    # 4. Reject playbook exceeding 100KB
+    oversized_playbook = dict(valid_payload, playbook={"huge_field": "X" * 105000})
+    res4 = client.post("/api/v1/trajectories", json=oversized_playbook, headers=headers)
+    assert res4.status_code == 422, f"Expected 422 for oversized playbook, got {res4.status_code}"
+
+    # 5. Reject search query exceeding 1,000 characters
+    res5 = client.post("/api/v1/trajectories/search", json={"query": "Q" * 1001})
+    assert res5.status_code == 422, f"Expected 422 for oversized search query, got {res5.status_code}"
+
+
+def test_09_rate_limiting_defense(client):
+    """Step 9: Assert slowapi rate limiting triggers HTTP 429 when threshold is exceeded."""
+    from backend.main import limiter
+    limiter.reset()
+
+    # Search endpoint is limited to 30 requests/minute
+    hit_429 = False
+    for _ in range(35):
+        resp = client.post(
+            "/api/v1/trajectories/search",
+            json={"query": "rate defense probe"},
+        )
+        if resp.status_code == 429:
+            hit_429 = True
+            body = resp.json()
+            assert body["detail"] == "Rate limit exceeded. Please retry in a few moments."
+            break
+
+    limiter.reset()
+    assert hit_429 is True, "Expected HTTP 429 after exceeding 30 requests/minute."
+
+
+def test_10_global_unhandled_exception_sanitization():
+    """Step 10: Global exception handler logs and returns sanitized 500 without leaking internals."""
+    from backend.main import app
+
+    @app.get("/api/v1/test-unhandled-panic")
+    def trigger_panic():
+        raise RuntimeError("Simulated internal database crash with password=super_secret_db_pass")
+
+    with TestClient(app, raise_server_exceptions=False) as unhandled_client:
+        res = unhandled_client.get("/api/v1/test-unhandled-panic")
+        assert res.status_code == 500
+        body = res.json()
+        assert body["error"] == "InternalServerError"
+        assert body["message"] == "An unexpected server error occurred. Please try again later."
+        assert "super_secret_db_pass" not in res.text
+        assert "Simulated internal database crash" not in res.text
+        assert "request_id" in body
+

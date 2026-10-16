@@ -1,20 +1,35 @@
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 import hashlib
+import json
+import logging
 import os
 from typing import Any, Dict, List, Optional
+import uuid
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Security, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security, status
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from sqlalchemy import text
 from sqlalchemy.orm import Session
-
-from contextlib import asynccontextmanager
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend.database import Base, engine, get_db
 from backend.models import Agent, Trajectory
 from backend.services.embedding_service import BaseEmbeddingService, get_embedding_service
 from backend.services.queue_service import BaseQueue, PostgresSkipLockedQueue
 from backend.services.vector_service import BaseVectorSearch, PgVectorService
+
+logger = logging.getLogger("agentflow.api")
+
+limiter = Limiter(key_func=get_remote_address)
 
 
 @asynccontextmanager
@@ -23,7 +38,7 @@ async def lifespan(app: FastAPI):
     try:
         Base.metadata.create_all(bind=engine)
     except Exception as exc:
-        print(f"Database init warning (verify pgvector extension): {exc}")
+        logger.warning(f"Database init warning (verify pgvector extension): {exc}")
 
     if os.getenv("START_WORKER", "false").lower() in ("true", "1", "yes"):
         from backend.worker import start_worker_thread
@@ -44,6 +59,7 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+app.state.limiter = limiter
 
 # Configure CORS origins: restrict to production and development domains, configurable via ALLOWED_ORIGINS env
 allowed_origins_raw = os.getenv(
@@ -62,6 +78,48 @@ app.add_middleware(
 )
 
 security = HTTPBearer()
+
+
+# ---------------------------------------------------------
+# Exception Handlers (Rate Limiting & Defensive Sanitization)
+# ---------------------------------------------------------
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    """Clean HTTP 429 response on rate limit exceeded."""
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={"detail": "Rate limit exceeded. Please retry in a few moments."},
+    )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global unhandled exception handler returning sanitized HTTP 500 response."""
+    # Ensure known HTTP exceptions, validation errors, and rate limits pass through untouched
+    if isinstance(exc, (HTTPException, StarletteHTTPException)):
+        return await http_exception_handler(request, exc)
+    if isinstance(exc, RequestValidationError):
+        return await request_validation_exception_handler(request, exc)
+    if isinstance(exc, RateLimitExceeded):
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": "Rate limit exceeded. Please retry in a few moments."},
+        )
+
+    req_id = str(uuid.uuid4())
+    logger.error(
+        f"[Unhandled Server Error] [request_id={req_id}] {request.method} {request.url.path}: {exc}",
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": "InternalServerError",
+            "message": "An unexpected server error occurred. Please try again later.",
+            "request_id": req_id,
+        },
+    )
 
 
 # ---------------------------------------------------------
@@ -101,16 +159,28 @@ def get_current_agent(
         )
     return agent
 
+
 # ---------------------------------------------------------
-# Pydantic Schemas
+# Pydantic Schemas with Defensive Validation
 # ---------------------------------------------------------
 
 class TrajectoryCreate(BaseModel):
-    title: str = Field(..., max_length=255, description="Brief summary of the issue or playbook")
-    task_goal: str = Field(..., description="High-level goal the agent was attempting to achieve")
-    error_trace: Optional[str] = Field(None, description="Stack trace or terminal error encountered")
+    title: str = Field(..., min_length=5, max_length=255, description="Brief summary of the issue or playbook")
+    task_goal: str = Field(..., min_length=5, max_length=2000, description="High-level goal the agent was attempting to achieve")
+    error_trace: Optional[str] = Field(None, max_length=20000, description="Stack trace or terminal error encountered")
     playbook: Dict[str, Any] = Field(..., description="Structured sequence of actions and tool calls used")
     embedding: Optional[List[float]] = Field(None, description="Pre-computed 1536-dim vector if available")
+
+    @field_validator("playbook")
+    @classmethod
+    def validate_playbook_size(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            serialized = json.dumps(v)
+        except Exception as e:
+            raise ValueError(f"Playbook must be JSON serializable: {e}")
+        if len(serialized.encode("utf-8")) > 100_000:
+            raise ValueError("Playbook payload exceeds maximum allowed size of 100KB")
+        return v
 
 
 class TrajectoryResponse(BaseModel):
@@ -126,7 +196,7 @@ class TrajectoryResponse(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    query: Optional[str] = Field(None, description="Plain-text problem description or error trace")
+    query: Optional[str] = Field(None, max_length=1000, description="Plain-text problem description or error trace")
     query_embedding: Optional[List[float]] = Field(None, description="Optional pre-computed 1536-dim vector")
     limit: int = Field(10, ge=1, le=50)
     similarity_threshold: Optional[float] = None
@@ -144,9 +214,52 @@ class SearchResult(BaseModel):
 
 
 # ---------------------------------------------------------
-# API Routes
+# Health & Observability Probe
 # ---------------------------------------------------------
 
+@app.get("/healthz", summary="Deep health check & Railway liveness probe")
+def health_check(
+    db: Session = Depends(get_db),
+    embedder: BaseEmbeddingService = Depends(get_embedding_service),
+):
+    """Deep health check verifying database connectivity and embedding service readiness."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception as db_err:
+        logger.error(f"Health check failed on database ping: {db_err}")
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "status": "unhealthy",
+                "database": f"error: {str(db_err)}",
+                "embedding_service": "active" if embedder else "unavailable",
+                "timestamp": now_iso,
+            },
+        )
+
+    if not embedder:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "status": "unhealthy",
+                "database": "connected",
+                "embedding_service": "unavailable",
+                "timestamp": now_iso,
+            },
+        )
+
+    return {
+        "status": "healthy",
+        "database": "connected",
+        "embedding_service": "active",
+        "timestamp": now_iso,
+    }
+
+
+# ---------------------------------------------------------
+# API Routes
+# ---------------------------------------------------------
 
 @app.post(
     "/api/v1/trajectories",
@@ -154,7 +267,9 @@ class SearchResult(BaseModel):
     status_code=status.HTTP_201_CREATED,
     summary="Publish execution trajectory (Agents only)",
 )
+@limiter.limit("60/minute")
 def create_trajectory(
+    request: Request,
     payload: TrajectoryCreate,
     agent: Agent = Depends(get_current_agent),
     db: Session = Depends(get_db),
@@ -205,25 +320,27 @@ def create_trajectory(
     response_model=List[SearchResult],
     summary="Semantic vector search across trajectories",
 )
+@limiter.limit("30/minute")
 def search_trajectories(
-    request: SearchRequest,
+    request: Request,
+    search_request: SearchRequest,
     vector_search: BaseVectorSearch = Depends(get_vector_service),
     embedder: BaseEmbeddingService = Depends(get_embedding_service),
 ):
     """Semantic vector match against past agent playbooks and error solutions."""
-    embedding = request.query_embedding
+    embedding = search_request.query_embedding
     if not embedding:
-        if not request.query:
+        if not search_request.query:
             raise HTTPException(
                 status_code=400,
                 detail="Must provide either 'query' or 'query_embedding'",
             )
-        embedding = embedder.generate_embedding(request.query)
+        embedding = embedder.generate_embedding(search_request.query)
 
     return vector_search.search(
         query_embedding=embedding,
-        limit=request.limit,
-        similarity_threshold=request.similarity_threshold,
+        limit=search_request.limit,
+        similarity_threshold=search_request.similarity_threshold,
     )
 
 
@@ -232,7 +349,9 @@ def search_trajectories(
     response_model=List[TrajectoryResponse],
     summary="Public read-only feed of agent trajectories",
 )
+@limiter.limit("120/minute")
 def list_trajectories(
+    request: Request,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
