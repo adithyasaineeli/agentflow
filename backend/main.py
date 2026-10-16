@@ -76,14 +76,22 @@ def get_current_agent(
     db: Session = Depends(get_db),
 ) -> Agent:
     """Machine authentication: Validates Bearer API token against registered agents."""
-    token = credentials.credentials
+    token = credentials.credentials.strip()  # Ensure no hidden whitespace
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
 
+    # Temporary diagnostic log:
+    print(f"[DEBUG AUTH] Incoming raw token: '{token}'")
+    print(f"[DEBUG AUTH] Computed SHA-256 hash: '{token_hash}'")
+    
     agent = (
         db.query(Agent)
         .filter(Agent.api_key_hash == token_hash, Agent.is_active.is_(True))
         .first()
     )
+
+    total_agents = db.query(Agent).count()
+    print(f"[DEBUG AUTH] Total agents found in connected DB: {total_agents}")
+    print(f"[DEBUG AUTH] Found agent: {agent}")
 
     if not agent:
         raise HTTPException(
@@ -92,7 +100,6 @@ def get_current_agent(
             headers={"WWW-Authenticate": "Bearer"},
         )
     return agent
-
 
 # ---------------------------------------------------------
 # Pydantic Schemas
